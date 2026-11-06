@@ -13,6 +13,7 @@ Usage:
   csync swap <a> <b>     Exchange the slot numbers of two accounts
   csync move <a> <slot>  Move an account to another slot (swaps if the slot is taken)
   csync org <account> <org-uuid> Pick the organization folder used for chat sync by hand
+  csync --version        Print the version
   csync --dry-run        Show what would happen without touching anything (with sync / switch)
 
 <account> = slot number, label, or the start of the account uuid.
@@ -29,6 +30,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+VERSION = "0.1.0"
 
 APP_DIR = os.environ.get("CSYNC_APP_DIR") or os.path.expanduser("~/Library/Application Support/Claude")
 HOME_DIR = os.environ.get("CSYNC_HOME") or os.path.expanduser("~/.csync")
@@ -536,6 +539,15 @@ def main():
     if args and args[0] in ("help", "-h", "--help"):
         print(__doc__)
         return
+    if args and args[0] in ("version", "-V", "--version"):
+        print(f"csync {VERSION}")
+        return
+    if sys.platform != "darwin" and not os.environ.get("CSYNC_NO_APP"):
+        print("csync only supports the Claude desktop app on macOS.", file=sys.stderr)
+        sys.exit(1)
+    if sys.version_info < (3, 9):
+        print("csync needs Python 3.9 or newer.", file=sys.stderr)
+        sys.exit(1)
     cmd, rest = (args[0], args[1:]) if args else ("sync", [])
     try:
         os.makedirs(HOME_DIR, mode=0o700, exist_ok=True)
