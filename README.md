@@ -20,7 +20,7 @@ A multi-account switcher and chat syncer for the **Claude desktop app** on macOS
 ## Install
 
 ```bash
-git clone https://github.com/<your-user>/csync.git
+git clone https://github.com/mirmirkedi/csync.git
 cd csync
 mkdir -p ~/.local/bin
 cp csync ~/.local/bin/csync && chmod +x ~/.local/bin/csync
