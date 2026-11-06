@@ -1,0 +1,555 @@
+#!/usr/bin/env -S python3 -I
+"""csync - multi-account switcher and chat syncer for the Claude desktop app (macOS).
+
+Usage:
+  csync                  Sync chats across all accounts (quits and reopens the app if it is running)
+  csync login            Prepare to add a new account: saves the current session, signs out, opens the app
+  csync add [label]      Save the account currently signed in to the app into a slot
+  csync list             List saved accounts
+  csync status           Show which account is signed in right now
+  csync switch [account] Sync, then switch account (no argument: go to the next slot)
+  csync remove <account> Remove an account from the list (chats are left alone)
+  csync label <account> <name>   Set a label
+  csync swap <a> <b>     Exchange the slot numbers of two accounts
+  csync move <a> <slot>  Move an account to another slot (swaps if the slot is taken)
+  csync org <account> <org-uuid> Pick the organization folder used for chat sync by hand
+  csync --dry-run        Show what would happen without touching anything (with sync / switch)
+
+<account> = slot number, label, or the start of the account uuid.
+
+No chat is ever deleted. Anything that gets overwritten is backed up under ~/.csync/backup.
+Environment variables: CSYNC_APP_DIR (Claude data folder), CSYNC_HOME (csync data folder),
+CSYNC_NO_APP=1 (never quit/open the app; for testing).
+"""
+import glob
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+APP_DIR = os.environ.get("CSYNC_APP_DIR") or os.path.expanduser("~/Library/Application Support/Claude")
+HOME_DIR = os.environ.get("CSYNC_HOME") or os.path.expanduser("~/.csync")
+SESSIONS_ROOT = os.path.join(APP_DIR, "claude-code-sessions")
+CONFIG = os.path.join(APP_DIR, "config.json")
+COOKIES = os.path.join(APP_DIR, "Cookies")
+STATE = os.path.join(HOME_DIR, "accounts.json")
+SNAP_DIR = os.path.join(HOME_DIR, "snapshots")
+BACKUP_DIR = os.path.join(HOME_DIR, "backup")
+
+# Keys in config.json that belong to the signed-in account
+AUTH_KEYS = ("oauth:tokenCache", "oauth:tokenCacheV2", "lastKnownAccountUuid")
+# Cookie hosts that hold the login session
+COOKIE_HOSTS = ("%claude.ai", "%anthropic.com")
+APP_BINARY = "Claude.app/Contents/MacOS/Claude"
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------- file helpers ----------
+
+def write_json(path, data, indent=2):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=indent, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_config():
+    try:
+        with open(CONFIG) as f:
+            raw = f.read()
+        return json.loads(raw), (2 if raw.count("\n") > 1 else None)
+    except FileNotFoundError:
+        return {}, 2
+    except json.JSONDecodeError as e:
+        raise Fail(f"Could not read {CONFIG}: {e}")
+
+
+def write_config(cfg, indent):
+    tmp = CONFIG + ".csync-tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=indent, ensure_ascii=False)
+    os.replace(tmp, CONFIG)
+
+
+def copy_db(src, dst):
+    """Copy a SQLite file consistently (journal/WAL included)."""
+    tmp = dst + ".tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    d = sqlite3.connect(tmp)
+    try:
+        s.backup(d)
+    finally:
+        d.close()
+        s.close()
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dst)
+
+
+def backup_live(stamp):
+    """Back up the live cookies and config files."""
+    bdir = os.path.join(BACKUP_DIR, stamp, "live")
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    if os.path.exists(CONFIG):
+        shutil.copy2(CONFIG, bdir)
+    if os.path.exists(COOKIES):
+        copy_db(COOKIES, os.path.join(bdir, "Cookies"))
+
+
+# ---------- app control ----------
+
+def app_running():
+    if os.environ.get("CSYNC_NO_APP"):  # testing: never quit/open the app
+        return False
+    out = subprocess.run(["ps", "-axo", "comm"], capture_output=True, text=True).stdout
+    return any(line.endswith(APP_BINARY) for line in out.splitlines())
+
+
+def quit_app():
+    print("Quitting the Claude app...")
+    subprocess.run(["osascript", "-e", 'quit app "Claude"'], capture_output=True)
+    for _ in range(40):
+        if not app_running():
+            time.sleep(1)  # let pending file writes finish
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def open_app():
+    if os.environ.get("CSYNC_NO_APP"):
+        return
+    print("Reopening the Claude app...")
+    subprocess.run(["open", "-a", "Claude"])
+
+
+def run_with_app_closed(fn, reopen=None):
+    """Quit the app, run fn(), then reopen it if it was running (or if reopen=True)."""
+    was_running = app_running()
+    if was_running and not quit_app():
+        raise Fail("The Claude app did not quit. Quit it by hand (Cmd+Q) and try again.")
+    try:
+        return fn()
+    finally:
+        if was_running if reopen is None else reopen:
+            open_app()
+
+
+# ---------- account registry ----------
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"accounts": {}}
+
+
+def save_state(st):
+    write_json(STATE, st)
+
+
+def current_uuid():
+    return read_config()[0].get("lastKnownAccountUuid")
+
+
+def has_login():
+    cfg = read_config()[0]
+    if "oauth:tokenCacheV2" not in cfg and "oauth:tokenCache" not in cfg:
+        return False
+    if not os.path.exists(COOKIES):
+        return False
+    con = sqlite3.connect(f"file:{COOKIES}?mode=ro", uri=True)
+    try:
+        n = con.execute("SELECT count(*) FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai'").fetchone()[0]
+    finally:
+        con.close()
+    return n > 0
+
+
+def slot_of(st, uuid):
+    for slot, a in st["accounts"].items():
+        if a["uuid"] == uuid:
+            return slot
+    return None
+
+
+def resolve(st, ref):
+    accs = st["accounts"]
+    if ref in accs:
+        return ref
+    low = ref.lower()
+    for slot, a in accs.items():
+        if a.get("label", "").lower() == low:
+            return slot
+    hits = [s for s, a in accs.items() if a["uuid"].startswith(low)]
+    if len(hits) == 1:
+        return hits[0]
+    raise Fail(f"Account not found: {ref}")
+
+
+def sorted_slots(st):
+    return sorted(st["accounts"], key=int)
+
+
+def free_slot(st):
+    n = 1
+    while str(n) in st["accounts"]:
+        n += 1
+    return str(n)
+
+
+def newest_mtime(d):
+    files = glob.glob(os.path.join(d, "local_*.json"))
+    return max([os.path.getmtime(p) for p in files] or [os.path.getmtime(d)])
+
+
+def detect_org(uuid):
+    """Pick the account's most recently used organization folder."""
+    base = os.path.join(SESSIONS_ROOT, uuid)
+    if not os.path.isdir(base):
+        return None
+    orgs = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+    if not orgs:
+        return None
+    return max(orgs, key=lambda o: newest_mtime(os.path.join(base, o)))
+
+
+def snap_path(uuid):
+    return os.path.join(SNAP_DIR, uuid)
+
+
+# ---------- session snapshots ----------
+
+def snapshot(uuid):
+    """Save the live session (cookies + tokens) into the account's snapshot folder."""
+    d = snap_path(uuid)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    copy_db(COOKIES, os.path.join(d, "Cookies"))
+    cfg = read_config()[0]
+    write_json(os.path.join(d, "auth.json"), {k: cfg[k] for k in AUTH_KEYS if k in cfg})
+
+
+def restore(uuid):
+    d = snap_path(uuid)
+    if not os.path.exists(os.path.join(d, "Cookies")):
+        raise Fail("This account has no saved session. Sign in with it and run 'csync add' first.")
+    copy_db(os.path.join(d, "Cookies"), COOKIES)
+    for suffix in ("-journal", "-wal", "-shm"):
+        try:
+            os.remove(COOKIES + suffix)
+        except FileNotFoundError:
+            pass
+    with open(os.path.join(d, "auth.json")) as f:
+        auth = json.load(f)
+    cfg, indent = read_config()
+    for k in AUTH_KEYS:
+        if k in auth:
+            cfg[k] = auth[k]
+        else:
+            cfg.pop(k, None)
+    write_config(cfg, indent)
+
+
+def clear_auth():
+    """Sign out: delete the session cookies and tokens."""
+    if os.path.exists(COOKIES):
+        con = sqlite3.connect(COOKIES)
+        try:
+            for h in COOKIE_HOSTS:
+                con.execute("DELETE FROM cookies WHERE host_key LIKE ?", (h,))
+            con.commit()
+        finally:
+            con.close()
+    cfg, indent = read_config()
+    for k in AUTH_KEYS:
+        cfg.pop(k, None)
+    write_config(cfg, indent)
+
+
+def save_current(st, stamp):
+    """If the signed-in account is registered, save its refreshed session back."""
+    uuid = current_uuid()
+    if uuid and slot_of(st, uuid) and has_login():
+        backup_live(stamp)
+        snapshot(uuid)
+        return uuid
+    return None
+
+
+# ---------- chat sync ----------
+
+def activity(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d.get("lastActivityAt") or d.get("createdAt") or 0, os.path.getmtime(path)
+    except Exception:
+        return 0, os.path.getmtime(path)
+
+
+def sync(st, stamp, dry_run=False):
+    dirs = {}
+    for slot in sorted_slots(st):
+        a = st["accounts"][slot]
+        org = a.get("org") or detect_org(a["uuid"])
+        d = os.path.join(SESSIONS_ROOT, a["uuid"], org) if org else None
+        if not d or not os.path.isdir(d):
+            print(f"Warning: no chat folder for [{slot}] {a['label']}, skipping.")
+            continue
+        dirs[f"[{slot}] {a['label']}"] = d
+    if len(dirs) < 2:
+        print("Need at least two accounts with chat folders to sync.")
+        return
+
+    newest = {}
+    for name, d in dirs.items():
+        for p in glob.glob(os.path.join(d, "local_*.json")):
+            fn = os.path.basename(p)
+            key = activity(p)
+            if fn not in newest or key > newest[fn][0]:
+                newest[fn] = (key, p)
+
+    copied = updated = 0
+    for fn, (key, src) in sorted(newest.items()):
+        for name, d in dirs.items():
+            dst = os.path.join(d, fn)
+            if os.path.abspath(dst) == os.path.abspath(src):
+                continue
+            if not os.path.exists(dst):
+                action = "copy"
+            elif activity(dst) < key:
+                action = "update"
+            else:
+                continue
+            if dry_run:
+                print(f"[dry run] {action}: {fn} -> {name}")
+            else:
+                if action == "update":
+                    bdir = os.path.join(BACKUP_DIR, stamp, "sessions", os.path.basename(os.path.dirname(d)))
+                    os.makedirs(bdir, mode=0o700, exist_ok=True)
+                    shutil.copy2(dst, bdir)
+                shutil.copy2(src, dst)
+            if action == "copy":
+                copied += 1
+            else:
+                updated += 1
+
+    prefix = "[dry run] " if dry_run else ""
+    print(f"{prefix}{copied} chats copied, {updated} chats updated. {len(newest)} chats in total.")
+
+
+# ---------- commands ----------
+
+def fmt(st, slot):
+    a = st["accounts"][slot]
+    mark = "*" if a["uuid"] == current_uuid() else " "
+    org = (a.get("org") or "?")[:8]
+    return f"{mark} [{slot}] {a['label']}  (account {a['uuid'][:8]}, org {org})"
+
+
+def cmd_list(st, _):
+    if not st["accounts"]:
+        print("No accounts saved. Sign in to the app and run 'csync add'.")
+    for slot in sorted_slots(st):
+        print(fmt(st, slot))
+
+
+def cmd_status(st, _):
+    uuid = current_uuid()
+    if not uuid or not has_login():
+        print("No account is signed in to the app.")
+        return
+    slot = slot_of(st, uuid)
+    if slot:
+        print(fmt(st, slot))
+    else:
+        print(f"The signed-in account ({uuid[:8]}) is not saved. Add it with 'csync add'.")
+
+
+def cmd_add(st, args, dry_run=False):
+    label = args[0] if args else None
+
+    def do():
+        if not has_login() or not current_uuid():
+            raise Fail("No account is signed in to the app. Sign in first.")
+        uuid = current_uuid()
+        backup_live(time.strftime("%Y%m%d-%H%M%S"))
+        slot = slot_of(st, uuid)
+        if slot is None:
+            slot = free_slot(st)
+            st["accounts"][slot] = {"uuid": uuid, "label": label or f"account-{uuid[:6]}"}
+            verb = "added"
+        else:
+            if label:
+                st["accounts"][slot]["label"] = label
+            verb = "updated"
+        a = st["accounts"][slot]
+        org = detect_org(uuid)
+        if org:
+            a["org"] = org
+        snapshot(uuid)
+        save_state(st)
+        print(f"Account {verb}: {fmt(st, slot)}")
+        if not a.get("org"):
+            print("Note: this account has no chat folder yet; run 'csync add' again after its first chat.")
+
+    run_with_app_closed(do)
+
+
+def cmd_login(st, _):
+    def do():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        uuid = current_uuid()
+        if uuid and has_login():
+            if not slot_of(st, uuid):
+                raise Fail("The signed-in account is not saved. Run 'csync add' first so you don't lose it.")
+            save_current(st, stamp)
+        backup_live(stamp)
+        clear_auth()
+        print("Session cleared.")
+
+    run_with_app_closed(do, reopen=True)
+    print("Sign in to the app with the new account, then run 'csync add [label]'.")
+
+
+def cmd_switch(st, args, dry_run=False):
+    if not st["accounts"]:
+        raise Fail("No accounts saved. Sign in to the app and run 'csync add'.")
+    cur = slot_of(st, current_uuid())
+    if args:
+        target = resolve(st, args[0])
+    else:
+        order = sorted_slots(st)
+        if len(order) < 2:
+            raise Fail("There is no other account to switch to.")
+        target = order[(order.index(cur) + 1) % len(order)] if cur in order else order[0]
+    if target == cur:
+        print("You are already on this account.")
+        return
+    t = st["accounts"][target]
+    if not os.path.exists(os.path.join(snap_path(t["uuid"]), "Cookies")):
+        raise Fail(f"[{target}] {t['label']} has no saved session.")
+    if dry_run:
+        print(f"[dry run] would switch [{cur or '?'}] -> [{target}] {t['label']}.")
+        sync(st, "", dry_run=True)
+        return
+
+    def do():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        save_current(st, stamp)
+        sync(st, stamp)
+        backup_live(stamp)
+        restore(t["uuid"])
+        print(f"Switched to: {fmt(st, target)}")
+
+    # The app is quit before the switch and reopened afterwards only if it was running.
+    run_with_app_closed(do)
+
+
+def cmd_sync(st, args, dry_run=False):
+    if dry_run:
+        sync(st, "", dry_run=True)
+        return
+
+    def do():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        save_current(st, stamp)
+        sync(st, stamp)
+
+    run_with_app_closed(do)
+
+
+def cmd_remove(st, args):
+    if not args:
+        raise Fail("Usage: csync remove <account>")
+    slot = resolve(st, args[0])
+    a = st["accounts"].pop(slot)
+    shutil.rmtree(snap_path(a["uuid"]), ignore_errors=True)
+    save_state(st)
+    print(f"Removed: [{slot}] {a['label']} (chats left in place)")
+
+
+def cmd_label(st, args):
+    if len(args) != 2:
+        raise Fail("Usage: csync label <account> <name>")
+    slot = resolve(st, args[0])
+    st["accounts"][slot]["label"] = args[1]
+    save_state(st)
+    print(fmt(st, slot))
+
+
+def cmd_swap(st, args):
+    if len(args) != 2:
+        raise Fail("Usage: csync swap <a> <b>")
+    a, b = resolve(st, args[0]), resolve(st, args[1])
+    st["accounts"][a], st["accounts"][b] = st["accounts"][b], st["accounts"][a]
+    save_state(st)
+    cmd_list(st, [])
+
+
+def cmd_move(st, args):
+    if len(args) != 2 or not args[1].isdigit() or int(args[1]) < 1:
+        raise Fail("Usage: csync move <account> <slot>")
+    a, dst = resolve(st, args[0]), str(int(args[1]))
+    accs = st["accounts"]
+    if dst in accs:
+        accs[a], accs[dst] = accs[dst], accs[a]
+    else:
+        accs[dst] = accs.pop(a)
+    save_state(st)
+    cmd_list(st, [])
+
+
+def cmd_org(st, args):
+    if len(args) != 2:
+        raise Fail("Usage: csync org <account> <org-uuid>")
+    slot = resolve(st, args[0])
+    uuid = st["accounts"][slot]["uuid"]
+    if not os.path.isdir(os.path.join(SESSIONS_ROOT, uuid, args[1])):
+        raise Fail("That account has no such organization folder.")
+    st["accounts"][slot]["org"] = args[1]
+    save_state(st)
+    print(fmt(st, slot))
+
+
+COMMANDS = {
+    "list": cmd_list, "status": cmd_status, "remove": cmd_remove, "label": cmd_label,
+    "swap": cmd_swap, "move": cmd_move, "org": cmd_org, "login": cmd_login,
+}
+DRY_COMMANDS = {"add": cmd_add, "switch": cmd_switch, "sync": cmd_sync}
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+    if args and args[0] in ("help", "-h", "--help"):
+        print(__doc__)
+        return
+    cmd, rest = (args[0], args[1:]) if args else ("sync", [])
+    try:
+        os.makedirs(HOME_DIR, mode=0o700, exist_ok=True)
+        st = load_state()
+        if cmd in DRY_COMMANDS:
+            DRY_COMMANDS[cmd](st, rest, dry_run=dry_run)
+        elif cmd in COMMANDS:
+            COMMANDS[cmd](st, rest)
+        else:
+            raise Fail(f"Unknown command: {cmd}\n\n{__doc__}")
+    except Fail as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
