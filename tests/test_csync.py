@@ -110,6 +110,7 @@ class CsyncTest(unittest.TestCase):
         self.assertIn("* [2] work", out)  # B is the signed-in one
         self.assertIn("[2] work", self.run_csync("status").stdout)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX permissions")
     def test_snapshot_files_are_private(self):
         self.two_accounts()
         for path in (os.path.join(self.home, "accounts.json"),

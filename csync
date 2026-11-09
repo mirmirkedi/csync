@@ -1,5 +1,5 @@
 #!/usr/bin/env -S python3 -I
-"""csync - multi-account switcher and chat syncer for the Claude desktop app (macOS).
+"""csync - multi-account switcher and chat syncer for the Claude desktop app (macOS / Windows).
 
 Usage:
   csync                  Sync chats across all accounts (quits and reopens the app if it is running)
@@ -25,6 +25,7 @@ CSYNC_NO_APP=1 (never quit/open the app; for testing).
 import glob
 import json
 import os
+import pathlib
 import shutil
 import sqlite3
 import subprocess
@@ -33,11 +34,26 @@ import time
 
 VERSION = "0.1.0"
 
-APP_DIR = os.environ.get("CSYNC_APP_DIR") or os.path.expanduser("~/Library/Application Support/Claude")
+IS_WIN = sys.platform == "win32"
+
+
+def default_app_dir():
+    if not IS_WIN:
+        return os.path.expanduser("~/Library/Application Support/Claude")
+    # Store (MSIX) install keeps its data in %LOCALAPPDATA%\Claude-Data\<package>; classic install in %APPDATA%\Claude.
+    local = os.environ.get("LOCALAPPDATA", "")
+    for cfg in sorted(glob.glob(os.path.join(local, "Claude-Data", "*", "config.json"))):
+        return os.path.dirname(cfg)
+    return os.path.join(os.environ.get("APPDATA", ""), "Claude")
+
+
+APP_DIR = os.environ.get("CSYNC_APP_DIR") or default_app_dir()
 HOME_DIR = os.environ.get("CSYNC_HOME") or os.path.expanduser("~/.csync")
 SESSIONS_ROOT = os.path.join(APP_DIR, "claude-code-sessions")
 CONFIG = os.path.join(APP_DIR, "config.json")
 COOKIES = os.path.join(APP_DIR, "Cookies")
+if not os.path.exists(COOKIES) and os.path.exists(os.path.join(APP_DIR, "Network", "Cookies")):
+    COOKIES = os.path.join(APP_DIR, "Network", "Cookies")  # newer Chromium / Windows layout
 STATE = os.path.join(HOME_DIR, "accounts.json")
 SNAP_DIR = os.path.join(HOME_DIR, "snapshots")
 BACKUP_DIR = os.path.join(HOME_DIR, "backup")
@@ -55,18 +71,22 @@ class Fail(Exception):
 
 # ---------- file helpers ----------
 
+def ro_uri(path):
+    return pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
 def write_json(path, data, indent=2):
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=indent, ensure_ascii=False)
     os.replace(tmp, path)
 
 
 def read_config():
     try:
-        with open(CONFIG) as f:
+        with open(CONFIG, encoding="utf-8") as f:
             raw = f.read()
         return json.loads(raw), (2 if raw.count("\n") > 1 else None)
     except FileNotFoundError:
@@ -77,7 +97,7 @@ def read_config():
 
 def write_config(cfg, indent):
     tmp = CONFIG + ".csync-tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=indent, ensure_ascii=False)
     os.replace(tmp, CONFIG)
 
@@ -87,7 +107,7 @@ def copy_db(src, dst):
     tmp = dst + ".tmp"
     if os.path.exists(tmp):
         os.remove(tmp)
-    s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    s = sqlite3.connect(ro_uri(src), uri=True)
     d = sqlite3.connect(tmp)
     try:
         s.backup(d)
@@ -110,20 +130,38 @@ def backup_live(stamp):
 
 # ---------- app control ----------
 
+def _ps(script):
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True)
+
+
+# Windows: the Store app lives under ...\WindowsApps\Claude_<ver>_<arch>__<publisher>\app\Claude.exe
+# (matching on the path keeps the Claude Code CLI's claude.exe out of it).
+_WIN_PROCS = ("Get-Process -Name claude -ErrorAction SilentlyContinue | "
+              r"Where-Object { $_.Path -like '*\Claude_*\app\Claude.exe' -or $_.Path -like '*\AnthropicClaude\*' }")
+
+
 def app_running():
     if os.environ.get("CSYNC_NO_APP"):  # testing: never quit/open the app
         return False
+    if IS_WIN:
+        return bool(_ps(_WIN_PROCS + " | Select-Object -First 1 -ExpandProperty Id").stdout.strip())
     out = subprocess.run(["ps", "-axo", "comm"], capture_output=True, text=True).stdout
     return any(line.endswith(APP_BINARY) for line in out.splitlines())
 
 
 def quit_app():
     print("Quitting the Claude app...")
-    subprocess.run(["osascript", "-e", 'quit app "Claude"'], capture_output=True)
-    for _ in range(40):
+    if IS_WIN:
+        _ps(_WIN_PROCS + " | ForEach-Object { $_.CloseMainWindow() | Out-Null }")
+    else:
+        subprocess.run(["osascript", "-e", 'quit app "Claude"'], capture_output=True)
+    for i in range(40):
         if not app_running():
             time.sleep(1)  # let pending file writes finish
             return True
+        if IS_WIN and i >= 10 and i % 4 == 2:  # Electron hides to the tray instead of quitting; stop it
+            _ps(_WIN_PROCS + " | Stop-Process -Force -ErrorAction SilentlyContinue")
         time.sleep(0.5)
     return False
 
@@ -132,14 +170,18 @@ def open_app():
     if os.environ.get("CSYNC_NO_APP"):
         return
     print("Reopening the Claude app...")
-    subprocess.run(["open", "-a", "Claude"])
+    if IS_WIN:
+        _ps("$a = Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1; "
+            r"if ($a) { Start-Process ('shell:AppsFolder\' + $a.AppID) }")
+    else:
+        subprocess.run(["open", "-a", "Claude"])
 
 
 def run_with_app_closed(fn, reopen=None):
     """Quit the app, run fn(), then reopen it if it was running (or if reopen=True)."""
     was_running = app_running()
     if was_running and not quit_app():
-        raise Fail("The Claude app did not quit. Quit it by hand (Cmd+Q) and try again.")
+        raise Fail("The Claude app did not quit. Quit it by hand (Cmd+Q / Alt+F4) and try again.")
     try:
         return fn()
     finally:
@@ -151,7 +193,7 @@ def run_with_app_closed(fn, reopen=None):
 
 def load_state():
     try:
-        with open(STATE) as f:
+        with open(STATE, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {"accounts": {}}
@@ -171,11 +213,14 @@ def has_login():
         return False
     if not os.path.exists(COOKIES):
         return False
-    con = sqlite3.connect(f"file:{COOKIES}?mode=ro", uri=True)
     try:
-        n = con.execute("SELECT count(*) FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai'").fetchone()[0]
-    finally:
-        con.close()
+        con = sqlite3.connect(ro_uri(COOKIES), uri=True)
+        try:
+            n = con.execute("SELECT count(*) FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai'").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return True  # Windows locks Cookies while the app runs; trust the tokens in config.json
     return n > 0
 
 
@@ -252,7 +297,7 @@ def restore(uuid):
             os.remove(COOKIES + suffix)
         except FileNotFoundError:
             pass
-    with open(os.path.join(d, "auth.json")) as f:
+    with open(os.path.join(d, "auth.json"), encoding="utf-8") as f:
         auth = json.load(f)
     cfg, indent = read_config()
     for k in AUTH_KEYS:
@@ -293,7 +338,7 @@ def save_current(st, stamp):
 
 def activity(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
         return d.get("lastActivityAt") or d.get("createdAt") or 0, os.path.getmtime(path)
     except Exception:
@@ -542,8 +587,8 @@ def main():
     if args and args[0] in ("version", "-V", "--version"):
         print(f"csync {VERSION}")
         return
-    if sys.platform != "darwin" and not os.environ.get("CSYNC_NO_APP"):
-        print("csync only supports the Claude desktop app on macOS.", file=sys.stderr)
+    if sys.platform not in ("darwin", "win32") and not os.environ.get("CSYNC_NO_APP"):
+        print("csync only supports the Claude desktop app on macOS and Windows.", file=sys.stderr)
         sys.exit(1)
     if sys.version_info < (3, 9):
         print("csync needs Python 3.9 or newer.", file=sys.stderr)
